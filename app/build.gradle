@@ -1,0 +1,13 @@
+plugins { id 'com.android.application' }
+android {
+    namespace 'dev.yide.powerbridge'
+    compileSdk 34
+    defaultConfig {
+        applicationId 'dev.yide.powerbridge'
+        minSdk 26
+        targetSdk 34
+        versionCode 11
+        versionName '0.11'
+    }
+    compileOptions { sourceCompatibility JavaVersion.VERSION_1_8; targetCompatibility JavaVersion.VERSION_1_8 }
+}
