@@ -35,4 +35,10 @@ public final class BridgeData {
         if (sample.cadence<0) return new byte[]{0,0,(byte)w,(byte)(w>>8)};
         return new byte[]{32,0,(byte)w,(byte)(w>>8),(byte)revolutions,(byte)(revolutions>>8),(byte)eventTicks,(byte)(eventTicks>>8)};
     }
+    public byte[] cadencePacket(long now) {
+        if (!isFresh(now) || sample.cadence < 0) return null;
+        advance(now);
+        return new byte[]{2, (byte) revolutions, (byte) (revolutions >> 8),
+                (byte) eventTicks, (byte) (eventTicks >> 8)};
+    }
 }

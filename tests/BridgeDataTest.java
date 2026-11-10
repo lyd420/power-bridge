@@ -25,6 +25,18 @@ public class BridgeDataTest {
         check(u(p,4)==5,"no revolutions backfilled across disconnect");
         check(u(p,6)==8192,"crank event time wraps at 64 seconds");
         d.update(sample(250,60),80000); check(d.packet(79999)==null,"clock regression cannot be fresh");
+        BridgeData dual = new BridgeData();
+        check(dual.cadencePacket(0)==null,"CSC requires real input");
+        dual.update(sample(250,90),0);
+        byte[] power = dual.packet(2000);
+        byte[] cadence = dual.cadencePacket(2000);
+        check(cadence.length==5 && cadence[0]==2,"CSC advertises crank data only");
+        check(u(cadence,1)==u(power,4) && u(cadence,3)==u(power,6),"CPS and CSC share the same crank events");
+        dual.update(sample(0,0),2000);
+        check(java.util.Arrays.equals(cadence,dual.cadencePacket(4000)),"stopping does not manufacture crank events");
+        check(dual.cadencePacket(5000)==null,"CSC expires stale input");
+        dual.update(XdsMeasurement.parse(new byte[]{100,0}),6000);
+        check(dual.cadencePacket(6000)==null,"missing RPM does not create CSC data");
         System.out.println("PASS: real output, cadence timing, loss, freshness and rollover");
     }
 }

@@ -10,15 +10,28 @@ import java.util.*;
 public class PowerService extends Service {
     private static UUID uuid(String id){return UUID.fromString("0000"+id+"-0000-1000-8000-00805f9b34fb");}
     private static final UUID CPS=uuid("1818"), MEASUREMENT=uuid("2a63"), CCCD=uuid("2902");
+    private static final UUID CSC=uuid("1816"), CSC_MEASUREMENT=uuid("2a5b");
     private final Handler handler=new Handler(Looper.getMainLooper());
     private final BridgeData readings=new BridgeData();
     private final Map<String,BluetoothDevice> peers=new HashMap<>();
     private final Map<String,byte[]> subscriptions=new HashMap<>();
-    private final Map<String,Long> pending=new HashMap<>();
+    private final Map<String,byte[]> cadenceSubscriptions=new HashMap<>();
+    private final Map<String,PendingNotification> pending=new HashMap<>();
+    private static final class PendingNotification {
+        final long time;
+        final byte[] nextCadence;
+        final boolean power;
+
+        PendingNotification(long time, byte[] nextCadence, boolean power) {
+            this.time = time;
+            this.nextCadence = nextCadence;
+            this.power = power;
+        }
+    }
     private BluetoothAdapter adapter;
     private BluetoothGattServer server;
     private BluetoothLeAdvertiser advertiser;
-    private BluetoothGattCharacteristic measurement;
+    private BluetoothGattCharacteristic measurement, cadenceMeasurement;
     private Ad350Client input;
     private PowerManager.WakeLock wakeLock;
     private boolean active, advertising, waitingForName, failed;
@@ -42,7 +55,7 @@ public class PowerService extends Service {
         startForeground(1,n);
         active=ProbeState.active=true;ProbeState.fresh=false;ProbeState.sent=ProbeState.packets=0;ProbeState.cadence=-1;
         ProbeState.inputStatus="正在初始化";ProbeState.headStatus="正在准备连接";
-        ProbeState.log("功率桥接0.11：真实AD350输入，无模拟数据");
+        ProbeState.log("功率桥接0.12-csc-test：真实AD350输入，无模拟数据");
         try{initialize();}catch(RuntimeException e){fail("启动失败："+e.getMessage());}
         return START_NOT_STICKY;
     }
@@ -73,6 +86,22 @@ public class PowerService extends Service {
         ProbeState.deviceName=getSharedPreferences("sensor",MODE_PRIVATE).getString("name","AD350 功率计");
         input.start(saved);handler.post(tick);
     }
+    private void registerCadence() {
+        BluetoothGattService service = new BluetoothGattService(CSC, BluetoothGattService.SERVICE_TYPE_PRIMARY);
+        cadenceMeasurement = new BluetoothGattCharacteristic(CSC_MEASUREMENT, BluetoothGattCharacteristic.PROPERTY_NOTIFY, 0);
+        BluetoothGattDescriptor cccd = new BluetoothGattDescriptor(CCCD,
+                BluetoothGattDescriptor.PERMISSION_READ | BluetoothGattDescriptor.PERMISSION_WRITE);
+        cccd.setValue(new byte[]{0, 0});
+        cadenceMeasurement.addDescriptor(cccd);
+        service.addCharacteristic(cadenceMeasurement);
+
+        BluetoothGattCharacteristic feature = new BluetoothGattCharacteristic(uuid("2a5c"),
+                BluetoothGattCharacteristic.PROPERTY_READ, BluetoothGattCharacteristic.PERMISSION_READ);
+        feature.setValue(new byte[]{2, 0});
+        service.addCharacteristic(feature);
+        if (!server.addService(service)) fail("无法注册独立踏频服务");
+    }
+
     private void prepareName(){
         SharedPreferences prefs=getSharedPreferences("p515-name",MODE_PRIVATE);
         String current=adapter.getName();
@@ -95,7 +124,7 @@ public class PowerService extends Service {
         try{
             AdvertiseSettings settings=new AdvertiseSettings.Builder().setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY).setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_MEDIUM).setConnectable(true).setTimeout(0).build();
             AdvertiseData data=new AdvertiseData.Builder().addServiceUuid(new ParcelUuid(CPS)).addManufacturerData(0xffff,P715Sample.manufacturerData()).build();
-            AdvertiseData response=new AdvertiseData.Builder().setIncludeDeviceName(true).build();
+            AdvertiseData response=new AdvertiseData.Builder().setIncludeDeviceName(true).addServiceUuid(new ParcelUuid(CSC)).build();
             advertiser.startAdvertising(settings,data,response,advertisingCallback);
         }catch(RuntimeException e){fail("广播失败："+e.getMessage());}
     }
@@ -104,32 +133,53 @@ public class PowerService extends Service {
         public void onStartFailure(int code){handler.post(()->{if(active)fail("码表广播失败（"+code+"）");});}
     };
     private void counts(){
-        ProbeState.headConnections=peers.size();ProbeState.headSubscriptions=subscriptions.size();
-        ProbeState.headStatus=!subscriptions.isEmpty()?"已连接 · 已订阅功率":!peers.isEmpty()?"已连接 · 等待订阅":advertising?"等待 C606 Pro 连接":"正在准备广播";
+        ProbeState.headConnections=peers.size();ProbeState.headSubscriptions=subscriptions.size()+cadenceSubscriptions.size();
+        ProbeState.headStatus=!subscriptions.isEmpty()?"已连接 · 已订阅功率":!cadenceSubscriptions.isEmpty()?"已连接 · 已订阅踏频":!peers.isEmpty()?"已连接 · 等待订阅":advertising?"等待 C606 Pro 连接":"正在准备广播";
     }
     private final Runnable tick=new Runnable(){public void run(){
         if(!active)return;
         long now=SystemClock.elapsedRealtime();byte[] packet=readings.packet(now);ProbeState.fresh=packet!=null;
+        byte[] cadencePacket=readings.cadencePacket(now);
         try{
             for(String id:new ArrayList<>(peers.keySet())){
                 BluetoothDevice device=peers.get(id);
                 if(pending.containsKey(id)){
-                    if(now-pending.get(id)>5000){ProbeState.log("码表通知超时，等待重新连接");server.cancelConnection(device);drop(id);counts();}
+                    if(now-pending.get(id).time>5000){ProbeState.log("码表通知超时，等待重新连接");server.cancelConnection(device);drop(id);counts();}
                     continue;
                 }
-                if(packet==null||!subscriptions.containsKey(id))continue;
-                pending.put(id,now);boolean ok;
-                if(Build.VERSION.SDK_INT>=33)ok=server.notifyCharacteristicChanged(device,measurement,false,packet)==BluetoothStatusCodes.SUCCESS;
-                else{measurement.setValue(packet);ok=server.notifyCharacteristicChanged(device,measurement,false);}
-                if(!ok){pending.remove(id);ProbeState.log("功率通知未入队，下一次重试");}
+                byte[] cadence = cadenceSubscriptions.containsKey(id) ? cadencePacket : null;
+                if (packet != null && subscriptions.containsKey(id)) {
+                    notifyMeasurement(device, measurement, packet, new PendingNotification(now, cadence, true));
+                } else if (cadence != null) {
+                    notifyMeasurement(device, cadenceMeasurement, cadence, new PendingNotification(now, null, false));
+                }
             }
         }catch(RuntimeException e){fail("转发失败："+e.getMessage());return;}
         handler.postDelayed(this,1000);
     }};
-    private void drop(String id){peers.remove(id);subscriptions.remove(id);pending.remove(id);}
+    private void notifyMeasurement(BluetoothDevice device, BluetoothGattCharacteristic characteristic,
+            byte[] packet, PendingNotification notification) {
+        String address = device.getAddress();
+        pending.put(address, notification);
+        boolean queued;
+        if (Build.VERSION.SDK_INT >= 33) {
+            queued = server.notifyCharacteristicChanged(device, characteristic, false, packet) == BluetoothStatusCodes.SUCCESS;
+        } else {
+            characteristic.setValue(packet);
+            queued = server.notifyCharacteristicChanged(device, characteristic, false);
+        }
+        if (!queued) {
+            pending.remove(address);
+            ProbeState.log("测量通知未入队，下一次重试");
+        }
+    }
+
+    private void drop(String id){peers.remove(id);subscriptions.remove(id);cadenceSubscriptions.remove(id);pending.remove(id);}
     private void response(BluetoothDevice d,int id,int status,int offset,byte[] value){if(active&&server!=null)server.sendResponse(d,id,status,offset,value);}
     private final BluetoothGattServerCallback callbacks=new BluetoothGattServerCallback(){
-        public void onServiceAdded(int status,BluetoothGattService service){handler.post(()->{if(!active)return;if(status==BluetoothGatt.GATT_SUCCESS)prepareName();else fail("码表服务注册失败（"+status+"）");});}
+        public void onServiceAdded(int status,BluetoothGattService service){handler.post(()->{if(!active)return;if(status!=BluetoothGatt.GATT_SUCCESS)fail("码表服务注册失败（"+status+"）");
+            else if(CPS.equals(service.getUuid()))registerCadence();
+            else if(CSC.equals(service.getUuid()))prepareName();});}
         public void onConnectionStateChange(BluetoothDevice d,int status,int state){handler.post(()->{
             if(!active)return;
             if(status==BluetoothGatt.GATT_SUCCESS&&state==BluetoothProfile.STATE_CONNECTED){peers.put(d.getAddress(),d);ProbeState.log("码表侧蓝牙已连接");}
@@ -137,12 +187,13 @@ public class PowerService extends Service {
         });}
         public void onCharacteristicReadRequest(BluetoothDevice d,int id,int offset,BluetoothGattCharacteristic c){handler.post(()->{
             byte[] value=c.getValue();
-            if(MEASUREMENT.equals(c.getUuid())||value==null)response(d,id,BluetoothGatt.GATT_READ_NOT_PERMITTED,offset,null);
+            if(MEASUREMENT.equals(c.getUuid())||CSC_MEASUREMENT.equals(c.getUuid())||value==null)response(d,id,BluetoothGatt.GATT_READ_NOT_PERMITTED,offset,null);
             else if(offset<0||offset>value.length)response(d,id,BluetoothGatt.GATT_INVALID_OFFSET,offset,null);
             else response(d,id,BluetoothGatt.GATT_SUCCESS,offset,Arrays.copyOfRange(value,offset,value.length));
         });}
         public void onDescriptorReadRequest(BluetoothDevice d,int id,int offset,BluetoothGattDescriptor descriptor){handler.post(()->{
-            byte[] value=subscriptions.get(d.getAddress());if(value==null)value=new byte[]{0,0};
+            boolean cadence = CSC_MEASUREMENT.equals(descriptor.getCharacteristic().getUuid());
+            byte[] value=(cadence ? cadenceSubscriptions : subscriptions).get(d.getAddress());if(value==null)value=new byte[]{0,0};
             if(!CCCD.equals(descriptor.getUuid()))response(d,id,BluetoothGatt.GATT_REQUEST_NOT_SUPPORTED,offset,null);
             else if(offset<0||offset>2)response(d,id,BluetoothGatt.GATT_INVALID_OFFSET,offset,null);
             else response(d,id,BluetoothGatt.GATT_SUCCESS,offset,Arrays.copyOfRange(value,offset,2));
@@ -150,24 +201,47 @@ public class PowerService extends Service {
         public void onDescriptorWriteRequest(BluetoothDevice d,int id,BluetoothGattDescriptor descriptor,boolean prepared,boolean responseNeeded,int offset,byte[] value){
             byte[] copy=value==null?null:value.clone();handler.post(()->{
                 if(!active)return;
-                int status=BluetoothGatt.GATT_SUCCESS,action=NotificationConfig.action(copy,true);
-                if(prepared||!CCCD.equals(descriptor.getUuid())||!MEASUREMENT.equals(descriptor.getCharacteristic().getUuid()))status=BluetoothGatt.GATT_REQUEST_NOT_SUPPORTED;
+                UUID characteristic = descriptor.getCharacteristic().getUuid();
+                boolean power = MEASUREMENT.equals(characteristic);
+                boolean cadence = CSC_MEASUREMENT.equals(characteristic);
+                Map<String,byte[]> selected = cadence ? cadenceSubscriptions : subscriptions;
+                int status=BluetoothGatt.GATT_SUCCESS,action=NotificationConfig.action(copy,power);
+                if(prepared||!CCCD.equals(descriptor.getUuid())||(!power&&!cadence))status=BluetoothGatt.GATT_REQUEST_NOT_SUPPORTED;
                 else if(offset!=0)status=BluetoothGatt.GATT_INVALID_OFFSET;
                 else if(copy==null||copy.length!=2)status=BluetoothGatt.GATT_INVALID_ATTRIBUTE_LENGTH;
                 else if(action<0)status=BluetoothGatt.GATT_REQUEST_NOT_SUPPORTED;
-                else if(action==1){peers.put(d.getAddress(),d);subscriptions.put(d.getAddress(),copy);}
-                else subscriptions.remove(d.getAddress());
+                else if(action==1){peers.put(d.getAddress(),d);selected.put(d.getAddress(),copy);}
+                else selected.remove(d.getAddress());
                 if(responseNeeded)response(d,id,status,offset,null);
-                ProbeState.log("码表CCCD="+Arrays.toString(copy)+"，响应="+status);counts();
+                ProbeState.log((cadence?"踏频CCCD=":"码表CCCD=")+Arrays.toString(copy)+"，响应="+status);counts();
             });
         }
         public void onCharacteristicWriteRequest(BluetoothDevice d,int id,BluetoothGattCharacteristic c,boolean prepared,boolean needed,int offset,byte[] value){handler.post(()->{if(needed)response(d,id,BluetoothGatt.GATT_WRITE_NOT_PERMITTED,offset,null);});}
         public void onExecuteWrite(BluetoothDevice d,int id,boolean execute){handler.post(()->response(d,id,BluetoothGatt.GATT_REQUEST_NOT_SUPPORTED,0,null));}
         public void onNotificationSent(BluetoothDevice d,int status){handler.post(()->{
             if(!active)return;
-            Long time=pending.remove(d.getAddress());
-            if(time!=null&&status==BluetoothGatt.GATT_SUCCESS){ProbeState.sent++;if(ProbeState.sent==1||ProbeState.sent%30==0)ProbeState.log("真实功率转发回调成功，累计="+ProbeState.sent);}
-            else if(status!=BluetoothGatt.GATT_SUCCESS)ProbeState.log("码表通知错误="+status);
+            String address = d.getAddress();
+            PendingNotification notification = pending.remove(address);
+            if (notification == null) return;
+            if (status != BluetoothGatt.GATT_SUCCESS) {
+                ProbeState.log("码表通知错误="+status);
+            } else if (notification.power) {
+                ProbeState.sent++;
+                if (ProbeState.sent==1 || ProbeState.sent%30==0) {
+                    ProbeState.log("真实功率转发回调成功，累计="+ProbeState.sent);
+                }
+            }
+            long now = SystemClock.elapsedRealtime();
+            if (notification.nextCadence != null && now - notification.time < 1000
+                    && peers.containsKey(address) && cadenceSubscriptions.containsKey(address)
+                    && readings.isFresh(now)) {
+                try {
+                    notifyMeasurement(d, cadenceMeasurement, notification.nextCadence,
+                            new PendingNotification(now, null, false));
+                } catch (RuntimeException e) {
+                    fail("踏频转发失败："+e.getMessage());
+                }
+            }
         });}
     };
     private final BroadcastReceiver bluetoothState=new BroadcastReceiver(){public void onReceive(Context c,Intent i){if(i.getIntExtra(BluetoothAdapter.EXTRA_STATE,-1)==BluetoothAdapter.STATE_TURNING_OFF)fail("手机蓝牙已关闭");}};
@@ -178,7 +252,7 @@ public class PowerService extends Service {
         if(input!=null)input.stop();readings.invalidate();ProbeState.fresh=false;
         try{if(advertiser!=null)advertiser.stopAdvertising(advertisingCallback);}catch(RuntimeException ignored){}
         try{if(server!=null){for(BluetoothDevice d:peers.values())server.cancelConnection(d);server.clearServices();server.close();}}catch(RuntimeException ignored){}
-        server=null;peers.clear();subscriptions.clear();pending.clear();ProbeState.headConnections=ProbeState.headSubscriptions=0;
+        server=null;peers.clear();subscriptions.clear();cadenceSubscriptions.clear();pending.clear();ProbeState.headConnections=ProbeState.headSubscriptions=0;
         try{
             if(adapter!=null&&adapter.isEnabled()){
                 SharedPreferences prefs=getSharedPreferences("p515-name",MODE_PRIVATE);String original=prefs.getString("original",null);
